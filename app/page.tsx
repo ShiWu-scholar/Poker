@@ -1210,21 +1210,33 @@ export default function Home() {
     const sourceCard = cardsRef.current.find((card) => card.id === cardId);
     if (!sourceCard) return;
     const id = Date.now();
-    updateCardTurns(cardId, (current) => [
-      ...current,
-      {
-        id,
-        title: question.length > 26 ? `${question.slice(0, 26)}…` : question,
-        user: question,
-        body: (
-          <div className="typing-line">
-            <span />
-            <span />
-            <span />
-          </div>
-        ),
-      },
-    ]);
+    let didSuppress = false;
+    updateCardTurns(cardId, (current) => {
+      // Ignore duplicate sends (the same question already in-flight for this card)
+      const pending = current.find(
+        (turn) => turn.user === question && !turn.assistantText,
+      );
+      if (pending) {
+        didSuppress = true;
+        return current;
+      }
+      return [
+        ...current,
+        {
+          id,
+          title: question.length > 26 ? `${question.slice(0, 26)}…` : question,
+          user: question,
+          body: (
+            <div className="typing-line">
+              <span />
+              <span />
+              <span />
+            </div>
+          ),
+        },
+      ];
+    });
+    if (didSuppress) return;
     try {
       const reply = await requestAiReply(question, sourceCard);
       const demo = !apiUrl.trim() || !apiKey.trim() || !apiModel.trim();
