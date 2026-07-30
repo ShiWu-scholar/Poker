@@ -205,28 +205,33 @@ export async function POST(request: Request) {
       }),
       signal: AbortSignal.timeout(45000),
     });
-    const upstreamPayload = (await upstream.json()) as {
+
+    const upstreamText = await upstream.text();
+    let upstreamPayload: Record<string, unknown>;
+    try {
+      upstreamPayload = JSON.parse(upstreamText) as Record<string, unknown>;
+    } catch {
+      upstreamPayload = {};
+    }
+
+    if (!upstream.ok) {
+      const providerMessage = extractProviderMessage(upstreamPayload);
+      const hint = upstreamText
+        ? providerMessage || upstreamText.slice(0, 200)
+        : `HTTP ${upstream.status}`;
+      return Response.json(
+        { error: `上游接口返回错误：${hint}` },
+        { status: 502 },
+      );
+    }
+
+    const rawContent = (upstreamPayload as {
       choices?: Array<{
         message?: {
           content?: string | Array<{ type?: string; text?: string }>;
         };
       }>;
-      error?: unknown;
-    };
-
-    if (!upstream.ok) {
-      const providerMessage = extractProviderMessage(upstreamPayload);
-      return Response.json(
-        {
-          error: providerMessage
-            ? `上游接口返回错误：${providerMessage}`
-            : `上游接口返回 HTTP ${upstream.status}`,
-        },
-        { status: 502 },
-      );
-    }
-
-    const rawContent = upstreamPayload.choices?.[0]?.message?.content;
+    }).choices?.[0]?.message?.content;
     const content = Array.isArray(rawContent)
       ? rawContent.map((part) => part.text ?? "").join("")
       : rawContent;
