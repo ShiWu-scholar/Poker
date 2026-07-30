@@ -1083,7 +1083,7 @@ export default function Home() {
     };
     const id = `card-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const title = titleOverride ?? seedPhrase ?? `${labels[kind]} ${currentCards.length}`;
-    const seededTurns: ChatTurn[] = seedPhrase
+    const seededTurns: ChatTurn[] = seedPhrase && !autoQuestion
       ? [
           {
             id: Date.now(),
