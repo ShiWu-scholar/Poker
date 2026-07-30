@@ -1051,6 +1051,7 @@ export default function Home() {
     parentId?: string,
     linkKey?: string,
     titleOverride?: string,
+    autoQuestion?: string,
   ) => {
     const currentCards = cardsRef.current;
     if (linkKey) {
@@ -1118,6 +1119,11 @@ export default function Home() {
     setCardOffset({ x: 0, y: 0 });
     setFavorite(false);
     notify(`已创建并打开${labels[kind]}`);
+    if (autoQuestion) {
+      window.setTimeout(() => {
+        sendProgrammaticMessage(autoQuestion, id);
+      }, 80);
+    }
   };
 
   const openAnnotatedBranch = (
@@ -1141,6 +1147,7 @@ export default function Home() {
       parentId,
       linkKey,
       term.text,
+      term.suggestedQuestion,
     );
   };
 
@@ -1199,19 +1206,16 @@ export default function Home() {
     return payload;
   };
 
-  const sendMessage = async () => {
-    const clean = message.trim();
-    if (!clean || sending) return;
-    const sourceCardId = activeCardId;
-    const sourceCard = cardsRef.current.find((card) => card.id === sourceCardId);
+  const sendProgrammaticMessage = async (question: string, cardId: string) => {
+    const sourceCard = cardsRef.current.find((card) => card.id === cardId);
+    if (!sourceCard) return;
     const id = Date.now();
-    setSending(true);
-    updateCardTurns(sourceCardId, (current) => [
+    updateCardTurns(cardId, (current) => [
       ...current,
       {
         id,
-        title: clean.length > 26 ? `${clean.slice(0, 26)}…` : clean,
-        user: clean,
+        title: question.length > 26 ? `${question.slice(0, 26)}…` : question,
+        user: question,
         body: (
           <div className="typing-line">
             <span />
@@ -1221,12 +1225,10 @@ export default function Home() {
         ),
       },
     ]);
-    setMessage("");
-    setModelOpen(false);
     try {
-      const reply = await requestAiReply(clean, sourceCard);
+      const reply = await requestAiReply(question, sourceCard);
       const demo = !apiUrl.trim() || !apiKey.trim() || !apiModel.trim();
-      updateCardTurns(sourceCardId, (current) =>
+      updateCardTurns(cardId, (current) =>
         current.map((turn) =>
           turn.id === id
             ? {
@@ -1244,7 +1246,7 @@ export default function Home() {
                     networkEnabled={networkEnabled}
                     demo={demo}
                     onTermClick={(term) =>
-                      openAnnotatedBranch(sourceCardId, id, term)
+                      openAnnotatedBranch(cardId, id, term)
                     }
                   />
                 ),
@@ -1255,7 +1257,7 @@ export default function Home() {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "模型接口请求失败";
-      updateCardTurns(sourceCardId, (current) =>
+      updateCardTurns(cardId, (current) =>
         current.map((turn) =>
           turn.id === id
             ? {
@@ -1279,7 +1281,17 @@ export default function Home() {
             : turn,
         ),
       );
-      notify("API 请求失败，请检查接口设置");
+    }
+  };
+
+  const sendMessage = async () => {
+    const clean = message.trim();
+    if (!clean || sending) return;
+    setSending(true);
+    setMessage("");
+    setModelOpen(false);
+    try {
+      await sendProgrammaticMessage(clean, activeCardId);
     } finally {
       setSending(false);
     }
