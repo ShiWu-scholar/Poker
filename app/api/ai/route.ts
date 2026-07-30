@@ -57,6 +57,11 @@ function validateEndpoint(value: string) {
   ) {
     throw new Error("该 API 地址不可用");
   }
+  // Auto-append /v1/chat/completions if user only provided base URL
+  const rawPath = endpoint.pathname.replace(/\/+$/g, "");
+  if (!rawPath || rawPath === "/" || rawPath === "/v1") {
+    endpoint.pathname = "/v1/chat/completions";
+  }
   return endpoint.toString();
 }
 
