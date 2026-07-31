@@ -12,9 +12,9 @@ type RawTerm = {
 };
 
 const SYSTEM_PROMPT = `你是 Explore 的回答与术语标注引擎。
-请只返回 JSON，不要使用 Markdown 代码块。格式必须是：
+请只返回 JSON，不要使用 Markdown 代码块包裹整个回复。格式必须是：
 {
-  "answer": "完整中文回答",
+  "answer": "完整中文回答（可适度使用 Markdown：## 标题、- 列表、**粗体**、$$公式$$、\\(行内公式\\)、\\[行间公式\\]、\`\`\`代码块\`\`\`、\`\`\`mermaid\`\`\` 图表、表格等增强可读性）",
   "terms": [
     {
       "text": "必须原样出现在 answer 中的专业名词",
@@ -25,7 +25,36 @@ const SYSTEM_PROMPT = `你是 Explore 的回答与术语标注引擎。
     }
   ]
 }
-回答应清晰、准确。只标注真正值得展开的专业名词，每次 1 到 6 个；不要标注普通词、整句或相互重叠的文本。`;
+在 answer 中适度使用 Markdown 格式（标题、列表、粗体、公式、代码块、表格等）来增强可读性，
+但要保证术语的 UTF-16 字符起始和结束索引与 answer 字符串中的位置完全对应。
+回答应清晰、准确。只标注真正值得展开的专业名词，宁缺毋滥；不要标注普通词、泛化词、整句或相互重叠的文本。
+请尽力覆盖文中所有值得展开的专业术语，数量不限，但每一条都必须是真正专业、值得用户点击追问的术语。`;
+
+const STREAMING_SYSTEM_PROMPT = `你是 Explore 的知识回答引擎。请用清晰、准确的中文回答用户的问题。
+回答应详细、完整且结构清晰。直接输出符合 Markdown 语法的回答内容。
+
+你可以使用以下 Markdown 格式来增强可读性：
+- 使用 ## 或 ### 创建层级标题
+- 使用 - 创建无序列表，使用 1. 创建有序列表
+- 使用 **粗体** 强调关键概念
+- 使用 $$公式$$ 或 $公式$ 嵌入数学公式（LaTeX 语法）
+- 也可使用 \\(行内公式\\)、\\[行间公式\\] 或 \\begin{equation} 等 LaTeX 环境写法
+- 使用 \`\`\`language 创建代码块
+- 使用 \`\`\`mermaid 创建流程图或时序图
+- 使用表格对比信息
+- 使用 > 引用重点内容
+
+注意：不要用三个反引号包裹整个回答，直接输出 Markdown 文本内容即可。`;
+
+// Asking for the full JSON annotation (offsets + canonicalKey + question)
+// makes DeepSeek emit hundreds of KB of reasoning even with effort:none,
+// blowing the timeout. A bare term array returns in ~1.5s; the server fills
+// in offsets (via indexOf) and defaults for the other fields.
+const TERMS_EXTRACTION_PROMPT = `你是 Explore 的术语标注引擎。
+请为以下文本标注专业术语，只返回 JSON，不要使用 Markdown 代码块。
+格式必须是：{"terms":["专业名词1","专业名词2"]}
+只标注真正值得展开的专业名词，宁缺毋滥；不要标注普通词、泛化词、整句或相互重叠的文本。
+请尽力覆盖文中所有值得展开的专业术语，数量不限，但每一条都必须是真正专业、值得用户点击追问的术语。`;
 
 function isPrivateIpv4(hostname: string) {
   const parts = hostname.split(".").map(Number);
@@ -131,7 +160,8 @@ function normalizeTerms(answer: string, value: unknown) {
 
   const accepted: typeof normalized = [];
   for (const term of normalized) {
-    if (accepted.length >= 6) break;
+    // No hard cap — the model is trusted to judge quality. Keep only the
+    // dedupe and overlap filters, which prevent duplicate/crossing markers.
     const previous = accepted.at(-1);
     if (previous && term.start < previous.end) continue;
     if (
@@ -145,6 +175,88 @@ function normalizeTerms(answer: string, value: unknown) {
     accepted.push(term);
   }
   return accepted;
+}
+
+async function extractTerms(
+  answerText: string,
+  endpoint: string,
+  apiKey: string,
+  model: string,
+): Promise<NonNullable<ReturnType<typeof normalizeTerms>>> {
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: TERMS_EXTRACTION_PROMPT },
+          // Key terms overwhelmingly appear in the opening definition of a
+          // reply. Keeping the excerpt short is what makes DeepSeek's
+          // extraction hit its fast path (~300ms); full replies (>2k chars)
+          // reliably hit the slow path and time out even with effort:none.
+          { role: "user", content: answerText.slice(0, 500) },
+        ],
+        temperature: 0.1,
+        // Term extraction is a pure structured task — disable thinking so it
+        // returns in ~300ms instead of 45s+ (reasoner effort would time out).
+        reasoning: { effort: "none" },
+        // Stream the extraction: in the local Cloudflare worker runtime the
+        // non-streaming path has a large fixed latency, while streaming
+        // upstream calls return promptly (same as /api/ai).
+        stream: true,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok || !response.body) return [];
+    // Accumulate the SSE streamed content.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let content = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const chunk = JSON.parse(data) as {
+            choices?: Array<{ delta?: { content?: string } }>;
+          };
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (typeof delta === "string" && delta.length > 0) content += delta;
+        } catch {
+          // Skip unparseable chunks
+        }
+      }
+    }
+    if (!content) return [];
+
+    const parsed = parseModelJson(content);
+    // New prompt returns a bare string array: {"terms":["术语1",...]}.
+    // Convert to the object shape normalizeTerms expects; offsets are resolved
+    // server-side via indexOf, and canonicalKey/suggestedQuestion get defaults.
+    const rawTerms = parsed.terms;
+    const objectTerms = Array.isArray(rawTerms)
+      ? rawTerms.map((item) =>
+          typeof item === "string" ? { text: item } : item,
+        )
+      : [];
+    const result = normalizeTerms(answerText, objectTerms);
+    return result;
+  } catch (e) {
+    return [];
+  }
 }
 
 function extractProviderMessage(payload: unknown) {
@@ -165,6 +277,7 @@ export async function POST(request: Request) {
       apiKey?: unknown;
       model?: unknown;
       messages?: unknown;
+      stream?: unknown;
     };
     const endpoint =
       typeof payload.endpoint === "string"
@@ -194,6 +307,134 @@ export async function POST(request: Request) {
       );
     }
 
+    // --- Streaming SSE response ---
+    const shouldStream = payload.stream === true;
+    if (shouldStream) {
+      const upstreamResponse = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: STREAMING_SYSTEM_PROMPT },
+            ...messages,
+          ],
+          stream: true,
+          temperature: 0.4,
+        }),
+        signal: AbortSignal.timeout(120000),
+      });
+
+      if (!upstreamResponse.ok || !upstreamResponse.body) {
+        const errorText = await upstreamResponse.text();
+        let errorPayload: Record<string, unknown> = {};
+        try {
+          errorPayload = JSON.parse(errorText) as Record<string, unknown>;
+        } catch {
+          /* ignore */
+        }
+        return Response.json(
+          {
+            error:
+              extractProviderMessage(errorPayload) ||
+              `上游错误 ${upstreamResponse.status}`,
+          },
+          { status: 502 },
+        );
+      }
+
+      const encoder = new TextEncoder();
+      let accumulatedAnswer = "";
+
+      const sseStream = new ReadableStream({
+        async start(controller) {
+          const reader = upstreamResponse.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          try {
+            // Pass 1: stream delta tokens
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || !trimmed.startsWith("data:")) continue;
+                const data = trimmed.slice(5).trim();
+                if (data === "[DONE]") continue;
+
+                try {
+                  const chunk = JSON.parse(data);
+                  const delta = (
+                    chunk as {
+                      choices?: Array<{ delta?: { content?: string } }>;
+                    }
+                  ).choices?.[0]?.delta?.content;
+                  if (typeof delta === "string" && delta.length > 0) {
+                    accumulatedAnswer += delta;
+                    const ssePayload = JSON.stringify({
+                      type: "delta",
+                      content: delta,
+                    });
+                    controller.enqueue(
+                      encoder.encode(`data: ${ssePayload}\n\n`),
+                    );
+                  }
+                } catch {
+                  // Skip unparseable chunks
+                }
+              }
+            }
+
+            // Terms are harvested CLIENT-SIDE via POST /api/terms based on the
+            // exact streamed answer text. We deliberately do NOT use the
+            // parallel non-streaming request's terms here: that request
+            // generates its OWN answer text, so its start/end offsets never
+            // match the streamed body and would mis-annotate the buttons.
+            // Close the stream immediately so the body renders right away.
+            const termsPayload = JSON.stringify({
+              type: "terms",
+              terms: [],
+              providerModel: model,
+            });
+            controller.enqueue(encoder.encode(`data: ${termsPayload}\n\n`));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          } catch (error) {
+            try {
+              const msg =
+                error instanceof Error ? error.message : "Stream error";
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ type: "error", message: msg })}\n\n`,
+                ),
+              );
+            } catch {
+              /* ignore */
+            }
+            controller.error(error);
+          }
+        },
+      });
+
+      return new Response(sseStream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-store",
+          Connection: "keep-alive",
+        },
+      });
+    }
+
+    // --- Non-streaming path (existing behavior) ---
     const upstream = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -266,3 +507,7 @@ export async function POST(request: Request) {
     );
   }
 }
+
+// Exported for reuse by the /api/terms route (client-side term re-fetch after
+// the streaming response has already closed).
+export { extractTerms, validateEndpoint };

@@ -780,8 +780,48 @@ button:disabled {
 }
 
 .chat-turn {
+  position: relative;
+  overflow: hidden;
   padding: 10px 10px 22px;
   border-bottom: 1px solid var(--line);
+}
+
+/* "Terms ready" sweep — when this turn's reply has clickable term buttons,
+   a faint grey diagonal light bar sweeps across the card once to signal the
+   annotation layer is complete. Uses :has() so no JS wiring is needed. */
+.chat-turn:has(.branch-phrase)::after {
+  content: "";
+  position: absolute;
+  top: -20%;
+  left: -30%;
+  width: 35%;
+  height: 150%;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    rgba(128, 128, 128, 0.05) 40%,
+    rgba(128, 128, 128, 0.12) 50%,
+    rgba(128, 128, 128, 0.05) 60%,
+    transparent 100%
+  );
+  transform: translateX(-100%) rotate(0deg);
+  animation: terms-ready-sweep 800ms ease-out 1;
+}
+
+@keyframes terms-ready-sweep {
+  0% {
+    transform: translateX(-40%) skewX(-18deg);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(320%) skewX(-18deg);
+    opacity: 0;
+  }
 }
 
 .chat-turn:last-of-type {
@@ -813,12 +853,68 @@ button:disabled {
   background: var(--brand-soft);
 }
 
+/* --- Attachment tags on user message bubble bottom edge --- */
+.user-message-group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.user-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  margin: -6px 0 16px 70px;
+  padding-right: 32px;
+}
+
+.user-attachment-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  max-width: 240px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text-faint);
+  background: var(--surface-raised);
+  font-family: var(--font-geist-mono), "Cascadia Code", "Consolas", monospace;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.user-attachment-tag svg {
+  flex-shrink: 0;
+  opacity: 0.55;
+}
+
+.user-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
+  color: var(--text-soft);
+}
+
+.user-attachment-meta {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 9px;
+}
+
 .answer-copy {
   color: var(--text-soft);
   font-size: 14px;
   line-height: 1.8;
 }
 
+/* --- Markdown rendered elements --- */
+.answer-copy h1 { margin: 24px 0 6px; font-size: 23px; color: var(--text); font-weight: 700; }
 .answer-copy h2 {
   margin: 8px 0 1px;
   color: var(--text);
@@ -834,6 +930,53 @@ button:disabled {
 .answer-copy p {
   margin: 5px 0 11px;
 }
+.answer-copy h4 { margin: 14px 0 2px; font-size: 15px; color: var(--text); font-weight: 600; }
+.answer-copy ul,
+.answer-copy ol { margin: 6px 0; padding-left: 22px; }
+.answer-copy li { margin: 3px 0; }
+.answer-copy li > p { margin: 0; }
+.answer-copy blockquote { margin: 8px 0; padding: 6px 14px; border-left: 3px solid var(--brand); background: var(--brand-soft); border-radius: 0 8px 8px 0; }
+.answer-copy code { padding: 1px 5px; font-size: 0.9em; background: var(--line); border-radius: 3px; font-family: var(--font-mono, "Geist Mono", monospace); }
+.answer-copy pre { margin: 8px 0; padding: 14px; overflow-x: auto; border-radius: 10px; background: #1e1e2e; color: #cdd6f4; font-size: 13px; line-height: 1.5; }
+.answer-copy pre code { padding: 0; background: none; font-size: inherit; }
+.answer-copy table { margin: 8px 0; border-collapse: collapse; width: 100%; font-size: 13px; }
+.answer-copy th,
+.answer-copy td { padding: 6px 12px; border: 1px solid var(--line); text-align: left; }
+.answer-copy th { background: var(--brand-soft); font-weight: 600; }
+.answer-copy hr { margin: 16px 0; border: 0; border-top: 1px solid var(--line); }
+.answer-copy strong { color: var(--text); font-weight: 700; }
+.answer-copy a { color: var(--brand); text-decoration: underline; text-underline-offset: 2px; }
+
+/* KaTeX overrides */
+.answer-copy .katex { font-size: 1.05em; }
+.answer-copy .katex-display { margin: 10px 0; overflow-x: auto; }
+
+/* Right-align equation numbers. KaTeX emits the tag with BOTH classes —
+   "katex-tag" for \begin{equation} auto-numbering and bare "tag" for
+   explicit \tag{...}. Only the former gets a right-align rule from katex.min.css,
+   so we cover the bare .tag case (which lives inside .katex-html) here.
+   Keep the tag on the right edge, vertically centered with the formula. */
+.answer-copy .katex-display .katex-html {
+  position: relative;
+}
+.answer-copy .katex-display .katex-html .tag,
+.answer-copy .katex-display .katex-html .katex-tag {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-right: 0.2em;
+}
+.answer-copy .katex-display.leqno .katex-html .tag,
+.answer-copy .katex-display.leqno .katex-html .katex-tag {
+  right: auto;
+  left: 0;
+  margin-left: 0.2em;
+}
+
+/* Mermaid container */
+.answer-copy .mermaid-container { margin: 10px 0; padding: 10px; border-radius: 10px; background: var(--line); }
+.answer-copy .mermaid-container svg { max-width: 100%; height: auto; }
 
 .branch-phrase {
   padding: 0 2px;
@@ -942,6 +1085,36 @@ button:disabled {
     transform: translateY(-2px);
     opacity: 1;
   }
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  background: var(--text);
+  vertical-align: text-bottom;
+  animation: cursor-blink 700ms infinite steps(1);
+}
+
+@keyframes cursor-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.streaming-answer .streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.2em;
+  margin-left: 2px;
+  background: var(--text);
+  vertical-align: text-bottom;
+  animation: cursor-blink 700ms infinite steps(1);
 }
 
 .scroll-button {
@@ -1426,6 +1599,77 @@ button:disabled {
   color: var(--text);
   background: transparent;
   line-height: 20px;
+}
+
+.attachment-strip {
+  position: absolute;
+  left: 13px;
+  right: 92px;
+  bottom: 55px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  z-index: 3;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  max-width: 210px;
+  padding: 0 6px 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-small);
+  font-size: 11px;
+  white-space: nowrap;
+  animation: toast-in 220ms ease both;
+}
+
+.attachment-chip.uploading {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+.attachment-chip-icon {
+  display: flex;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.attachment-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 110px;
+}
+
+.attachment-chip-size {
+  color: var(--text-faint);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.attachment-chip-remove {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  display: grid;
+  place-items: center;
+  color: var(--text-faint);
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.attachment-chip-remove:hover {
+  color: var(--text);
+  background: var(--brand-soft);
 }
 
 .composer textarea::placeholder {

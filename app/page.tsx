@@ -44,11 +44,28 @@ import {
   useMemo,
   useRef,
   useState,
+  createElement,
+  isValidElement,
+  cloneElement,
 } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
+import { lowlight } from "lowlight/lib/common";
+
+import "katex/dist/katex.min.css";
 
 type ModalName = "settings" | "account" | "guide" | "folder" | null;
 type ThemeName = "light" | "dark";
 type ApiConnectionStatus = "idle" | "checking" | "connected" | "error";
+
+type TurnAttachment = {
+  name: string;
+  type: string;
+  size: number;
+};
 
 type ChatTurn = {
   id: number;
@@ -56,6 +73,7 @@ type ChatTurn = {
   body: React.ReactNode;
   user?: string;
   assistantText?: string;
+  attachments?: TurnAttachment[];
 };
 
 type BranchKind = "root" | "child" | "divergent" | "branch";
@@ -72,6 +90,21 @@ type AiReplyPayload = {
   answer: string;
   terms: TermAnnotation[];
   providerModel?: string;
+};
+
+type SseDeltaEvent = { type: "delta"; content: string };
+type SseTermsEvent = { type: "terms"; terms: TermAnnotation[]; providerModel?: string };
+type SseErrorEvent = { type: "error"; message: string };
+type SseEvent = SseDeltaEvent | SseTermsEvent | SseErrorEvent;
+
+type AttachmentFile = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  text?: string;
+  truncated: boolean;
+  uploading: boolean;
 };
 
 type ConversationCardState = {
@@ -166,6 +199,12 @@ const themeOptions: { key: ThemeName; name: string; colors: string[] }[] = [
   { key: "dark", name: "雅黑 · 黑", colors: ["#090909", "#1d1d1d", "#ffffff"] },
 ];
 
+// Default API configuration used when no credentials are stored yet,
+// so quick debugging works out of the box.
+const DEFAULT_API_URL = "https://api.deepseek.com/";
+const DEFAULT_API_MODEL = "deepseek-v4-flash";
+const DEFAULT_API_KEY = "sk-9344648bf24d4d93a183b180f99dfc4f";
+
 const presetReplies = [
   {
     lead: "这个问题可以继续拆开分析，建议先从",
@@ -193,7 +232,7 @@ function getTreeDepth(
   cardId: string,
   byId: Map<string, ConversationCardState>,
   cache: Map<string, number>,
-) {
+): number {
   const cached = cache.get(cardId);
   if (cached !== undefined) return cached;
   const card = byId.get(cardId);
@@ -436,6 +475,297 @@ function ModalShell({
   );
 }
 
+// --- lowlight / highlight.js setup ---
+// lowlight/lib/common provides a pre-populated Lowlight instance
+// bundled with ~35 common languages.
+const lowlightInstance = lowlight;
+
+function highlightCode(code: string, language: string): React.ReactNode {
+  // The lowlight instance from "lowlight/lib/common" comes pre-bundled
+  // with ~35 common languages (javascript, python, bash, etc.).
+  if (!lowlightInstance.registered(language)) {
+    return <code>{code}</code>;
+  }
+  try {
+    const root = lowlightInstance.highlight(language, code);
+    return createLowlightElement(root);
+  } catch {
+    return <code>{code}</code>;
+  }
+}
+
+function MarkdownCode({
+  className,
+  children,
+  ...props
+}: {
+  className?: string;
+  children?: React.ReactNode;
+  inline?: boolean;
+}) {
+  const match = /language-(\w+)/.exec(className || "");
+  if (match && match[1] === "mermaid") {
+    return <MermaidBlock code={String(children).replace(/\n$/, "")} />;
+  }
+  const language = match ? match[1] : undefined;
+  if (!props.inline && language) {
+    try {
+      return highlightCode(String(children).replace(/\n$/, ""), language);
+    } catch {
+      // Fall through to plain pre/code
+    }
+  }
+  return (
+    <code className={className} {...props}>
+      {children}
+    </code>
+  );
+}
+
+function createLowlightElement(tree: unknown): React.ReactNode {
+  const root = tree as {
+    type?: string;
+    value?: string;
+    tagName?: string;
+    properties?: { className?: string[] };
+    children?: typeof root[];
+  };
+  if (!root) return null;
+  if (root.type === "text" || root.type === undefined) {
+    return String(root.value ?? "");
+  }
+  if (root.type === "element") {
+    const tag = root.tagName ?? "span";
+    const cls = root.properties?.className?.join(" ") || undefined;
+    const children = root.children
+      ? root.children.map((child, index) =>
+          // Give each list child a stable key to satisfy React.
+          addLowlightKey(createLowlightElement(child), index),
+        )
+      : null;
+    return createElement(tag, { className: cls }, children);
+  }
+  if (root.children) {
+    return root.children.map((child, index) =>
+      addLowlightKey(createLowlightElement(child), index),
+    );
+  }
+  return null;
+}
+
+function addLowlightKey(node: React.ReactNode, index: number): React.ReactNode {
+  if (isValidElement(node)) {
+    return cloneElement(node, { key: index });
+  }
+  return node;
+}
+
+// Math environment names that KaTeX supports as top-level display math.
+// These get wrapped in $$ ... $$ when the model emits them bare.
+const MATH_ENV_PATTERN =
+  "equation\\*?|align\\*?|aligned|gather\\*?|gathered|alignat\\*?|cases|dcases|rcases|drcases|matrix\\*?|[pbBVv]matrix\\*?|smallmatrix|CD";
+
+/**
+ * Finds the end index of the first complete paragraph at or after `from`.
+ * A paragraph ends at a blank line ("\n\n") or at a newline that begins a
+ * heading/list marker ("\n## ", "\n- ", "\n1. ", "\n> ", "\n```").
+ * Returns -1 when no complete paragraph boundary exists yet (still streaming).
+ */
+function findParagraphBoundary(
+  text: string,
+  from: number,
+): number {
+  // Blank-line separator — the canonical paragraph break.
+  const blank = text.indexOf("\n\n", from);
+  if (blank >= 0) return blank;
+
+  // Newline followed by a block-level marker on the next line.
+  const marker = /(?:\r?\n)(?=[#>|`\-\d]+[\s.])/g;
+  marker.lastIndex = from;
+  const m = marker.exec(text);
+  if (m && m.index >= from) return m.index;
+
+  return -1;
+}
+
+/**
+ * Normalizes the various LaTeX math delimiters AI models output into the
+ * $-style delimiters remark-math understands:
+ *
+ *   \( ... \)                 → $ ... $           (inline)
+ *   \[ ... \]                 → $$\n...\n$$       (display)
+ *   \begin{env}...\end{env}   → $$\n\begin{...}...\end{...}\n$$   (bare env)
+ *
+ * Robustness for streaming:
+ *   - Code blocks and inline code are extracted first so $-signs or \begin
+ *     inside them are never rewritten.
+ *   - Unclosed \[ or \( are left untouched (safe while a stream is mid-formula;
+ *     the next delta re-renders and completes the conversion).
+ *   - Idempotent: already-$$-wrapped environments are not double-wrapped.
+ */
+function normalizeMathDelimiters(source: string): string {
+  // 1. Protect code regions (fenced blocks + inline code) with placeholders.
+  const protectedBlocks: string[] = [];
+  const codePattern =
+    /```[\s\S]*?```|`[^`\n]*`|~{2,}[\s\S]*?~{2,}/g;
+  let result = source.replace(codePattern, (match) => {
+    protectedBlocks.push(match);
+    return ` MATHCODE${protectedBlocks.length - 1} `;
+  });
+
+  // 2. Display math: \[ ... \] → $$\n...\n$$  (dotAll, non-greedy)
+  result = result.replace(
+    /\\\[([\s\S]*?)\\\]/g,
+    (_match, body: string) => `\n\n$$\n${body.trim()}\n$$\n\n`,
+  );
+
+  // 3. Inline math: \( ... \) → $ ... $  (single-line body, non-greedy)
+  result = result.replace(
+    /\\\(([^\n]*?)\\\)/g,
+    (_match, body: string) => `$${body.trim()}$`,
+  );
+
+  // 4. Bare \begin{env}...\end{env} → wrap in $$ ... $$ unless already wrapped.
+  const envRegex = new RegExp(
+    `(?<![$])(^|\\n\\n)\\\\begin\\{(${MATH_ENV_PATTERN})\\}([\\s\\S]*?)\\\\end\\{\\2\\}(\\n\\n|$)(?![$])`,
+    "g",
+  );
+  result = result.replace(
+    envRegex,
+    (_match, before: string, envName: string, body: string, after: string) =>
+      `${before}\n$$\n\\begin{${envName}}${body}\\end{${envName}}\n$$\n${after}`,
+  );
+
+  // 5. Restore code blocks.
+  result = result.replace(/ MATHCODE(\d+) /g, (_match, index) => {
+    return protectedBlocks[Number(index)] ?? "";
+  });
+
+  return result;
+}
+
+/**
+ * Returns true if the character range [start, end) lies entirely inside a
+ * math formula (…$…$, $$…$$, \(…\), \[…\], or \begin{env}…\end{env}).
+ * Used to skip term-tag injection inside formulas — injecting <term> inside
+ * the $ delimiters makes remark-math mis-parse the math boundary, leaving a
+ * literal <term> tag behind and corrupting the formula.
+ */
+function isInsideFormula(source: string, start: number, end: number): boolean {
+  const mathPattern =
+    /\$\$[\s\S]*?\$\$|\$[^$\n]*\$|\\\([^)]*\\\)|\\\[[\s\S]*?\\\]|\\begin\{([^}]+)\}[\s\S]*?\\end\{\1\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = mathPattern.exec(source)) !== null) {
+    const fStart = m.index;
+    const fEnd = m.index + m[0].length;
+    if (start >= fStart && end <= fEnd) return true;
+  }
+  return false;
+}
+
+// Shared markdown renderer used both during streaming and for final answers.
+// KaTeX runs with throwOnError disabled so incomplete/partial formulas that
+// arrive mid-stream degrade to their LaTeX source instead of crashing.
+function MarkdownBody({ source }: { source: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[
+        rehypeRaw,
+        [rehypeKatex, { throwOnError: false, strict: false }],
+      ]}
+      components={{ code: MarkdownCode }}
+    >
+      {normalizeMathDelimiters(source)}
+    </ReactMarkdown>
+  );
+}
+
+/**
+ * Prepares an answer string for annotated rendering:
+ *  1. normalizes math delimiters (so term offsets match parsed text),
+ *  2. re-locates each term in the normalized text (skipping terms that fall
+ *     inside formulas or vanished after normalization),
+ *  3. injects <term data-index="i">…</term> tags.
+ * Returns the processed string plus an index → term map for the renderer.
+ */
+function injectTermTags(
+  answer: string,
+  terms: TermAnnotation[],
+): { processed: string; placedByIndex: Map<number, TermAnnotation> } {
+  const normalizedAnswer = normalizeMathDelimiters(answer);
+
+  const seenSpans = new Set<string>();
+  const sortedTerms = [...terms]
+    .sort((a, b) => b.start - a.start)
+    .filter((t) => {
+      const key = `${t.start}:${t.text}`;
+      if (seenSpans.has(key)) return false;
+      seenSpans.add(key);
+      return true;
+    });
+
+  const placedTerms: { term: TermAnnotation; start: number; end: number }[] = [];
+  for (const t of sortedTerms) {
+    const searchFrom = Math.max(
+      0,
+      Math.min(t.start, normalizedAnswer.length - t.text.length),
+    );
+    let relStart = normalizedAnswer.indexOf(t.text, searchFrom);
+    if (relStart < 0) relStart = normalizedAnswer.indexOf(t.text);
+    if (relStart < 0) continue;
+    const relEnd = relStart + t.text.length;
+    if (isInsideFormula(normalizedAnswer, relStart, relEnd)) continue;
+    placedTerms.push({ term: t, start: relStart, end: relEnd });
+  }
+
+  const sortedByStartDesc = [...placedTerms].sort((a, b) => b.start - a.start);
+  let processed = normalizedAnswer;
+  for (let i = 0; i < sortedByStartDesc.length; i++) {
+    const { start, end } = sortedByStartDesc[i];
+    processed =
+      processed.slice(0, start) +
+      `<term data-index="${i}">${processed.slice(start, end)}</term>` +
+      processed.slice(end);
+  }
+  const placedByIndex = new Map<number, TermAnnotation>();
+  sortedByStartDesc.forEach((p, index) => placedByIndex.set(index, p.term));
+  return { processed, placedByIndex };
+}
+
+/** Shared <term> → clickable button mapping used by both renderers. */
+function TermButtonMapper({
+  placedByIndex,
+  onTermClick,
+}: {
+  placedByIndex: Map<number, TermAnnotation>;
+  onTermClick: (term: TermAnnotation) => void;
+}) {
+  return (function TermMapping({
+    children,
+    "data-index": dataIndex,
+  }: {
+    children?: React.ReactNode;
+    "data-index"?: string;
+  }) {
+    const index = Number(dataIndex);
+    const term = placedByIndex.get(index);
+    if (term) {
+      return (
+        <button
+          type="button"
+          className="branch-phrase"
+          title={`创建深入卡片：${term.suggestedQuestion}`}
+          onClick={() => onTermClick(term)}
+        >
+          {term.text}
+        </button>
+      );
+    }
+    return <>{children}</>;
+  });
+}
+
 function AnnotatedReply({
   answer,
   terms,
@@ -451,35 +781,133 @@ function AnnotatedReply({
   demo?: boolean;
   onTermClick: (term: TermAnnotation) => void;
 }) {
-  const content: React.ReactNode[] = [];
-  let cursor = 0;
-
-  terms.forEach((term) => {
-    content.push(answer.slice(cursor, term.start));
-    content.push(
-      <button
-        type="button"
-        className="branch-phrase"
-        key={`${term.canonicalKey}-${term.start}`}
-        title={`创建深入卡片：${term.suggestedQuestion}`}
-        onClick={() => onTermClick(term)}
-      >
-        {term.text}
-      </button>,
-    );
-    cursor = term.end;
-  });
-  content.push(answer.slice(cursor));
+  const { processed, placedByIndex } = injectTermTags(answer, terms);
 
   return (
     <>
-      <p>{content}</p>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[
+          rehypeRaw,
+          [rehypeKatex, { throwOnError: false, strict: false }],
+        ]}
+        components={{
+          code: MarkdownCode,
+          term: TermButtonMapper({ placedByIndex, onTermClick }),
+        } as React.ComponentProps<typeof ReactMarkdown>["components"]}
+      >
+        {processed}
+      </ReactMarkdown>
       <p className="muted-copy">
         点击带下划线的专业名词即可弹起一张新卡片 · 当前模型：{modelLabel}
         {networkEnabled ? " · 已启用联网" : ""}
         {demo ? " · 演示回复" : ""}
       </p>
     </>
+  );
+}
+
+/**
+ * Streaming variant of AnnotatedReply: renders the live markdown body with
+ * whatever terms have been discovered so far, plus the blinking cursor.
+ * Used DURING streaming so paragraph term results appear incrementally while
+ * the body keeps flowing (and critically, does NOT set assistantText, so the
+ * streaming flush interval keeps updating the turn).
+ */
+function StreamingAnnotatedReply({
+  answer,
+  terms,
+  onTermClick,
+}: {
+  answer: string;
+  terms: TermAnnotation[];
+  onTermClick: (term: TermAnnotation) => void;
+}) {
+  const { processed, placedByIndex } = injectTermTags(answer, terms);
+
+  return (
+    <div className="streaming-answer">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[
+          rehypeRaw,
+          [rehypeKatex, { throwOnError: false, strict: false }],
+        ]}
+        components={{
+          code: MarkdownCode,
+          term: TermButtonMapper({ placedByIndex, onTermClick }),
+        } as React.ComponentProps<typeof ReactMarkdown>["components"]}
+      >
+        {processed}
+      </ReactMarkdown>
+      <span className="streaming-cursor" />
+    </div>
+  );
+}
+
+function MermaidBlock({ code }: { code: string }) {
+  const [svg, setSvg] = useState<string>("");
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    import("mermaid")
+      .then((mermaid) => {
+        if (cancelled) return;
+        mermaid.default.initialize({ startOnLoad: false, theme: "neutral" });
+        mermaid.default
+          .render(`mermaid-${Date.now()}`, code)
+          .then(({ svg: rendered }) => {
+            if (!cancelled) setSvg(rendered);
+          })
+          .catch(() => {
+            if (!cancelled) setError(true);
+          });
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
+
+  if (error) return <pre><code>{code}</code></pre>;
+  if (!svg)
+    return (
+      <div className="typing-line">
+        <span />
+        <span />
+        <span />
+      </div>
+    );
+  return (
+    <div
+      className="mermaid-container"
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
+}
+
+function StreamingReply({ text }: { text: string }) {
+  if (!text) {
+    return (
+      <div className="typing-line">
+        <span />
+        <span />
+        <span />
+      </div>
+    );
+  }
+  // Render the full markdown live during streaming so headers, lists,
+  // tables, formulas and code blocks appear as soon as they complete,
+  // instead of waiting for the whole response then re-rendering.
+  // The blinking cursor is appended after the content.
+  return (
+    <div className="streaming-answer">
+      <MarkdownBody source={text} />
+      <span className="streaming-cursor" />
+    </div>
   );
 }
 
@@ -492,9 +920,9 @@ export default function Home() {
   const [storage, setStorage] = useState<"local" | "cloud">("local");
   const [modelOpen, setModelOpen] = useState(false);
   const [model, setModel] = useState("Step-3.5-Flash");
-  const [apiUrl, setApiUrl] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [apiModel, setApiModel] = useState("");
+  const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
+  const [apiKey, setApiKey] = useState(DEFAULT_API_KEY);
+  const [apiModel, setApiModel] = useState(DEFAULT_API_MODEL);
   const [apiConnectionStatus, setApiConnectionStatus] =
     useState<ApiConnectionStatus>("idle");
   const [apiConnectionMessage, setApiConnectionMessage] = useState(
@@ -522,6 +950,18 @@ export default function Home() {
   const [activeProject, setActiveProject] = useState("应用介绍");
   const [folderName, setFolderName] = useState("");
   const [toast, setToast] = useState("");
+  const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
+  const uploadingRef = useRef(false);
+  const pendingAttachmentContextRef = useRef("");
+  // Per-card streaming state. Each card gets its own slot so concurrent
+  // streams (e.g. a parent card still streaming while a term-card is spawned)
+  // render independently without overwriting each other.
+  const streamingRefs = useRef(
+    new Map<
+      string,
+      { text: string; dirty: boolean; turnId: number; terms: TermAnnotation[] }
+    >(),
+  );
   const [loginMode, setLoginMode] = useState<"login" | "register">("login");
   const [cardOffset, setCardOffset] = useState({ x: 0, y: 0 });
   const [universeView, setUniverseView] = useState({ scale: 1, x: 0, y: 0 });
@@ -602,9 +1042,9 @@ export default function Home() {
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      setApiUrl(window.localStorage.getItem("explore-api-url") ?? "");
-      setApiModel(window.localStorage.getItem("explore-api-model") ?? "");
-      setApiKey(window.sessionStorage.getItem("explore-api-key") ?? "");
+      setApiUrl(window.localStorage.getItem("explore-api-url") ?? DEFAULT_API_URL);
+      setApiModel(window.localStorage.getItem("explore-api-model") ?? DEFAULT_API_MODEL);
+      setApiKey(window.sessionStorage.getItem("explore-api-key") ?? DEFAULT_API_KEY);
     });
     return () => window.cancelAnimationFrame(frame);
   }, []);
@@ -785,6 +1225,208 @@ export default function Home() {
   };
 
   const notify = (text: string) => setToast(text);
+
+  const uploadFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    const incoming = Array.from(fileList);
+    const pending: AttachmentFile[] = incoming.map((file) => ({
+      id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name: file.name,
+      type: file.type || "application/octet-stream",
+      size: file.size,
+      uploading: true,
+      truncated: false,
+    }));
+
+    setAttachments((current) => [...current, ...pending]);
+
+    for (let i = 0; i < incoming.length; i++) {
+      const file = incoming[i];
+      const pendingId = pending[i].id;
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+        const response = await fetch("/api/upload", {
+          method: "POST",
+          body: formData,
+        });
+        const result = (await response.json()) as {
+          error?: string;
+          files?: Array<{
+            name: string;
+            type: string;
+            size: number;
+            text?: string;
+            truncated: boolean;
+          }>;
+        };
+        if (!response.ok) {
+          throw new Error(result.error || "上传失败");
+        }
+        const uploaded = result.files?.[0];
+        setAttachments((current) =>
+          current.map((att) =>
+            att.id === pendingId
+              ? {
+                  ...att,
+                  uploading: false,
+                  text: uploaded?.text,
+                  truncated: uploaded?.truncated ?? false,
+                }
+              : att,
+          ),
+        );
+      } catch (error) {
+        setAttachments((current) =>
+          current.filter((att) => att.id !== pendingId),
+        );
+        const message =
+          error instanceof Error ? error.message : "文件上传失败";
+        notify(`上传失败：${message}`);
+      }
+    }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((current) => current.filter((att) => att.id !== id));
+  };
+
+  const clearAttachments = () => setAttachments([]);
+
+  const uploadDocumentAndCreateCard = async (file: File) => {
+    notify(`正在处理文档：${file.name}…`);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const response = await fetch("/api/upload", {
+        method: "POST",
+        body: formData,
+      });
+      const result = (await response.json()) as {
+        error?: string;
+        files?: Array<{
+          name: string;
+          type: string;
+          size: number;
+          text?: string;
+          truncated: boolean;
+        }>;
+      };
+      if (!response.ok) {
+        throw new Error(result.error || "文档上传失败");
+      }
+      const uploaded = result.files?.[0];
+      if (!uploaded) throw new Error("未收到文档内容");
+
+      const docTurns: ChatTurn[] = [];
+      if (uploaded.text) {
+        // Split text by double-newline into paragraphs for reading turns
+        const paragraphs = uploaded.text
+          .split(/\n{2,}/)
+          .map((para) => para.trim())
+          .filter((para) => para.length > 0);
+        if (paragraphs.length > 0) {
+          const chunks: string[] = [];
+          let chunk = "";
+          for (const para of paragraphs) {
+            if (chunk && chunk.length + para.length > 1800) {
+              chunks.push(chunk);
+              chunk = para;
+            } else {
+              chunk = chunk ? `${chunk}\n\n${para}` : para;
+            }
+          }
+          if (chunk) chunks.push(chunk);
+
+          docTurns.push(
+            ...chunks.map((text, index) => {
+              const id = Date.now() + index;
+              const preview = text.slice(0, 42).replace(/\n/g, " ");
+              return {
+                id,
+                title: chunks.length === 1
+                  ? `文档内容 · ${uploaded.name}`
+                  : `第 ${index + 1}/${chunks.length} 段 · ${preview}…`,
+                body: (
+                  <>
+                    {chunks.length > 1 && (
+                      <div className="thinking">
+                        <span>
+                          <Sparkles size={14} /> 段落 {index + 1} / {chunks.length}
+                        </span>
+                        <span>{uploaded.name}</span>
+                      </div>
+                    )}
+                    {text.split("\n").map((line, lineIndex) => (
+                      <p key={lineIndex}>{line || " "}</p>
+                    ))}
+                  </>
+                ),
+              };
+            }),
+          );
+        }
+      }
+      if (docTurns.length === 0) {
+        // Binary file or unreadable text
+        docTurns.push({
+          id: Date.now(),
+          title: `文档 · ${uploaded.name}`,
+          body: (
+            <>
+              <p>
+                文件 <strong>{uploaded.name}</strong>（{formatFileSize(uploaded.size)}
+                ）已上传。
+              </p>
+              <p className="muted-copy">
+                此文件为{uploaded.type.split("/")[0] === "text" ? "文本" : "二进制"}格式
+                {uploaded.type ? `（${uploaded.type}）` : ""}
+                ，无法直接提取文本内容进行分段阅读。
+              </p>
+            </>
+          ),
+        });
+      }
+
+      const title = `文档 · ${uploaded.name}`;
+      const cardId = `root-${Date.now()}`;
+      const nextCard: ConversationCardState = {
+        id: cardId,
+        title,
+        parentId: null,
+        kind: "root",
+        turns: docTurns,
+      };
+      const nextCards = [nextCard];
+      branchTargetRef.current.clear();
+      markUniverseNodeEntering(cardId);
+      commitCards(nextCards);
+      commitActiveCard(cardId);
+      setBackgroundCardId(null);
+      resetCardView();
+      setActiveProject(title);
+      setProjects((current) =>
+        current.includes(title) ? current : [...current, title],
+      );
+      if (isMobileViewport()) setSidebarOpen(false);
+      notify(
+        uploaded.text
+          ? `已解析文档「${uploaded.name}」为 ${docTurns.length} 个段落`
+          : `已上传「${uploaded.name}」`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "文档处理失败";
+      notify(`文档处理失败：${message}`);
+    }
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
   const resetApiConnectionStatus = () => {
     apiConnectionTestRef.current += 1;
     setApiConnectionStatus("idle");
@@ -924,6 +1566,23 @@ export default function Home() {
     if (isMobileViewport()) setSidebarOpen(false);
     setUniverseOpen(true);
     if (autoClose) schedulePanelClose("universe");
+
+    // Wait for the CSS enter transition (~220ms) to finish so the canvas
+    // has a real width before centering on the active card.
+    const frame = window.requestAnimationFrame(() => {
+      window.setTimeout(() => {
+        const canvas = universeCanvasRef.current;
+        const selectedNode = universeLayout.find(
+          ({ card }) => card.id === activeCardId,
+        );
+        if (!canvas || !selectedNode) return;
+        setUniverseView((current) => ({
+          ...current,
+          x: canvas.clientWidth / 2 - selectedNode.position.x * current.scale,
+          y: canvas.clientHeight / 2 - selectedNode.position.y * current.scale,
+        }));
+      }, 250);
+    });
   };
 
   const resetCardView = () => {
@@ -1034,6 +1693,48 @@ export default function Home() {
     );
   };
 
+  // Stable ref for the streaming flush effect so it doesn't re-subscribe on every render
+  const updateCardTurnsRef = useRef(updateCardTurns);
+  updateCardTurnsRef.current = updateCardTurns;
+
+  // Flush streaming text to React state at ~50ms intervals
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      // Flush every card that has pending streaming deltas. Per-card state
+      // means concurrent cards stream independently. If a card already has
+      // terms, render the annotated streaming view so buttons persist while
+      // the body keeps flowing.
+      for (const [cardId, state] of streamingRefs.current) {
+        if (!state.dirty) continue;
+        state.dirty = false;
+        updateCardTurnsRef.current(cardId, (turns) =>
+          turns.map((turn) =>
+            turn.id === state.turnId
+              ? turn.assistantText
+                ? turn
+                : {
+                    ...turn,
+                    body:
+                      state.terms.length > 0 ? (
+                        <StreamingAnnotatedReply
+                          answer={state.text}
+                          terms={state.terms}
+                          onTermClick={(term) =>
+                            openAnnotatedBranch(cardId, turn.id, term)
+                          }
+                        />
+                      ) : (
+                        <StreamingReply text={state.text} />
+                      ),
+                  }
+              : turn,
+          ),
+        );
+      }
+    }, 50);
+    return () => window.clearInterval(interval);
+  }, []);
+
   const activateCard = (cardId: string, announcement?: string) => {
     if (cardId === activeCardIdRef.current) return;
     const target = cardsRef.current.find((card) => card.id === cardId);
@@ -1120,8 +1821,28 @@ export default function Home() {
     setFavorite(false);
     notify(`已创建并打开${labels[kind]}`);
     if (autoQuestion) {
+      // Pass the parent card's turns as invisible context so the term-spawned
+      // card understands the term's situational context (what discussion the
+      // term came from). Not shown to the user — only feeds the AI request.
+      //
+      // If the parent is still streaming, its current turn has no assistantText
+      // yet (it's only set when the stream finishes). Supplement it with the
+      // live streamed text from streamingRefs so the child card still gets the
+      // in-progress answer as context instead of only the question.
+      const parentForContext = cardsRef.current.find(
+        (card) => card.id === parent.id,
+      );
+      let parentTurns = parentForContext?.turns ?? [];
+      const parentStream = streamingRefs.current.get(parent.id);
+      if (parentStream) {
+        parentTurns = parentTurns.map((turn) =>
+          turn.id === parentStream.turnId && !turn.assistantText && parentStream.text
+            ? { ...turn, assistantText: parentStream.text }
+            : turn,
+        );
+      }
       window.setTimeout(() => {
-        sendProgrammaticMessage(autoQuestion, id);
+        sendProgrammaticMessage(autoQuestion, id, undefined, parentTurns);
       }, 80);
     }
   };
@@ -1189,6 +1910,13 @@ export default function Home() {
         return messages;
       });
 
+    // Append attachment content from ref (set by sendMessage, never shown to user)
+    const attachmentContext = pendingAttachmentContextRef.current;
+    pendingAttachmentContextRef.current = "";
+    const enrichedQuestion = attachmentContext
+      ? `${question}${attachmentContext}`
+      : question;
+
     const response = await fetch("/api/ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1196,7 +1924,7 @@ export default function Home() {
         endpoint: apiUrl.trim(),
         apiKey: apiKey.trim(),
         model: apiModel.trim(),
-        messages: [...context, { role: "user", content: question }],
+        messages: [...context, { role: "user", content: enrichedQuestion }],
       }),
     });
     const payload = (await response.json()) as AiReplyPayload & { error?: string };
@@ -1206,7 +1934,223 @@ export default function Home() {
     return payload;
   };
 
-  const sendProgrammaticMessage = async (question: string, cardId: string) => {
+  const requestAiReplyStream = async (
+    question: string,
+    sourceCard: ConversationCardState | undefined,
+    onDelta: (cumulativeText: string) => void,
+    onParagraph: (paragraphText: string, offset: number) => void,
+    extraContextTurns?: ChatTurn[],
+  ): Promise<AiReplyPayload> => {
+    // Demo mode — simulate streaming character by character
+    if (!apiUrl.trim() || !apiKey.trim() || !apiModel.trim()) {
+      const reply = buildDemoReply();
+      let displayed = "";
+      for (let i = 0; i < reply.answer.length; i++) {
+        displayed += reply.answer[i];
+        onDelta(displayed);
+        await new Promise((r) => window.setTimeout(r, 30));
+      }
+      return reply;
+    }
+
+    const turnToMessages = (
+      turn: ChatTurn,
+    ): Array<{ role: "user" | "assistant"; content: string }> => {
+      const messages: Array<{
+        role: "user" | "assistant";
+        content: string;
+      }> = [];
+      if (turn.user) messages.push({ role: "user", content: turn.user });
+      if (turn.assistantText) {
+        messages.push({ role: "assistant", content: turn.assistantText });
+      }
+      return messages;
+    };
+
+    // Prepend the parent card's context (invisible to the user — only feeds the
+    // AI request) so term-spawned cards understand the term's situational
+    // context instead of answering in a vacuum. Then the card's own history.
+    const context = [
+      ...(extraContextTurns ?? []).slice(-4).flatMap(turnToMessages),
+      ...(sourceCard?.turns ?? []).slice(-6).flatMap(turnToMessages),
+    ];
+
+    const attachmentContext = pendingAttachmentContextRef.current;
+    pendingAttachmentContextRef.current = "";
+    const enrichedQuestion = attachmentContext
+      ? `${question}${attachmentContext}`
+      : question;
+
+    const response = await fetch("/api/ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        endpoint: apiUrl.trim(),
+        apiKey: apiKey.trim(),
+        model: apiModel.trim(),
+        messages: [...context, { role: "user", content: enrichedQuestion }],
+        stream: true,
+      }),
+    });
+
+    const contentType = response.headers.get("content-type") || "";
+
+    // Fallback: upstream doesn't support streaming — simulate from JSON response
+    if (!contentType.includes("text/event-stream")) {
+      const payload = (await response.json()) as AiReplyPayload & {
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error || "模型接口请求失败");
+      }
+      let displayed = "";
+      for (let i = 0; i < payload.answer.length; i++) {
+        displayed += payload.answer[i];
+        onDelta(displayed);
+        await new Promise((r) => window.setTimeout(r, 10));
+      }
+      return payload;
+    }
+
+    // Process SSE stream
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let accumulatedAnswer = "";
+    let terms: TermAnnotation[] = [];
+    let providerModel = "";
+    let streamError = "";
+    // Tracks how far we've scanned accumulatedAnswer for complete paragraphs,
+    // so each paragraph is handed to onParagraph exactly once.
+    let paragraphScanIndex = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") {
+          // Body text is complete — resolve immediately so the UI renders
+          // without waiting for terms. Terms (if any) arrive in the earlier
+          // "terms" event or are re-fetched via /api/terms afterwards.
+          break;
+        }
+
+        try {
+          const event = JSON.parse(data) as SseEvent;
+          if (event.type === "delta") {
+            accumulatedAnswer += event.content;
+            onDelta(accumulatedAnswer);
+            // Scan for newly-completed paragraphs (separated by blank line,
+            // or a line break followed by a heading/list marker) and hand each
+            // off for parallel term extraction as it finishes streaming.
+            while (paragraphScanIndex < accumulatedAnswer.length) {
+              const nextBoundary = findParagraphBoundary(
+                accumulatedAnswer,
+                paragraphScanIndex,
+              );
+              if (nextBoundary < 0) break; // no complete paragraph yet
+              const paragraphText = accumulatedAnswer
+                .slice(paragraphScanIndex, nextBoundary)
+                .trim();
+              if (paragraphText) {
+                onParagraph(paragraphText, paragraphScanIndex);
+              }
+              paragraphScanIndex = nextBoundary + 1;
+            }
+          } else if (event.type === "terms") {
+            terms = event.terms;
+            providerModel = event.providerModel || "";
+          } else if (event.type === "error") {
+            streamError = event.message;
+          }
+        } catch {
+          // Skip unparseable events
+        }
+      }
+    }
+
+    // Flush the remaining tail as the final paragraph (last paragraph has no
+    // trailing blank line, so it only completes when the stream ends).
+    if (paragraphScanIndex < accumulatedAnswer.length) {
+      const tailText = accumulatedAnswer.slice(paragraphScanIndex).trim();
+      if (tailText) {
+        onParagraph(tailText, paragraphScanIndex);
+      }
+    }
+
+    if (streamError) throw new Error(streamError);
+    return { answer: accumulatedAnswer, terms, providerModel };
+  };
+
+  // Merge new terms into the accumulated list: sort by start, drop
+  // overlapping or duplicate entries (same text at same position).
+  const mergeTerms = (
+    existing: TermAnnotation[],
+    incoming: TermAnnotation[],
+  ): TermAnnotation[] => {
+    if (incoming.length === 0) return existing;
+    const seen = new Set<string>();
+    const merged: TermAnnotation[] = [];
+    for (const t of [...existing, ...incoming].sort(
+      (a, b) => a.start - b.start || b.end - a.end,
+    )) {
+      // Dedupe by text: the same phrase appearing in multiple paragraphs
+      // should only produce one clickable term (at its earliest occurrence).
+      const key = `${t.text}`;
+      if (seen.has(key)) continue;
+      const prev = merged.at(-1);
+      if (prev && t.start < prev.end) continue; // overlap
+      seen.add(key);
+      merged.push(t);
+    }
+    return merged;
+  };
+
+  // Fetch terms for a text excerpt via the standalone /api/terms endpoint.
+  // `offset` is the character position of this excerpt within the full answer;
+  // the endpoint returns segment-relative offsets, which we shift to absolute.
+  const requestTerms = async (
+    answer: string,
+    offset = 0,
+  ): Promise<TermAnnotation[]> => {
+    if (!apiUrl.trim() || !apiKey.trim() || !apiModel.trim()) return [];
+    const response = await fetch("/api/terms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        endpoint: apiUrl.trim(),
+        apiKey: apiKey.trim(),
+        model: apiModel.trim(),
+        answer,
+      }),
+    });
+    if (!response.ok) return [];
+    const payload = (await response.json()) as { terms?: TermAnnotation[] };
+    if (!Array.isArray(payload.terms)) return [];
+    // Shift segment-relative offsets into full-answer coordinates.
+    return payload.terms
+      .map((t) => ({
+        ...t,
+        start: t.start + offset,
+        end: t.end + offset,
+      }))
+      .filter((t) => t.start >= 0 && t.end > t.start);
+  };
+
+  const sendProgrammaticMessage = async (
+    question: string,
+    cardId: string,
+    turnAttachments?: TurnAttachment[],
+    contextTurns?: ChatTurn[],
+  ) => {
     const sourceCard = cardsRef.current.find((card) => card.id === cardId);
     if (!sourceCard) return;
     const id = Date.now();
@@ -1226,6 +2170,7 @@ export default function Home() {
           id,
           title: question.length > 26 ? `${question.slice(0, 26)}…` : question,
           user: question,
+          attachments: turnAttachments,
           body: (
             <div className="typing-line">
               <span />
@@ -1238,72 +2183,260 @@ export default function Home() {
     });
     if (didSuppress) return;
     try {
-      const reply = await requestAiReply(question, sourceCard);
       const demo = !apiUrl.trim() || !apiKey.trim() || !apiModel.trim();
-      updateCardTurns(cardId, (current) =>
-        current.map((turn) =>
-          turn.id === id
-            ? {
-                ...turn,
-                assistantText: reply.answer,
-                body: (
-                  <AnnotatedReply
-                    answer={reply.answer}
-                    terms={reply.terms}
-                    modelLabel={
-                      demo
-                        ? "演示模型"
-                        : reply.providerModel ?? apiModel.trim()
-                    }
-                    networkEnabled={networkEnabled}
-                    demo={demo}
-                    onTermClick={(term) =>
-                      openAnnotatedBranch(cardId, id, term)
-                    }
-                  />
-                ),
-              }
-            : turn,
-        ),
+
+      // Set up per-card streaming state. Each card owns its own slot, so a
+      // child card spawned from a still-streaming parent streams independently.
+      const streamingSlot = { text: "", dirty: false, turnId: id, terms: [] as TermAnnotation[] };
+      streamingRefs.current.set(cardId, streamingSlot);
+
+      // Accumulates terms discovered from each completed paragraph during
+      // streaming. Each new batch is merged (sorted, deduped) and handed to
+      // the streaming slot; the 50ms flush interval renders them so buttons
+      // appear as soon as they're known without stopping the body flow.
+      let turnTerms: TermAnnotation[] = [];
+
+      // Re-render the turn with the current set of terms. During streaming
+      // (final=false) we render a streaming-aware annotated body and do NOT set
+      // assistantText, so the flush interval keeps updating the body as new
+      // deltas arrive. Only the final render (final=true) sets assistantText
+      // and switches to the static AnnotatedReply.
+      const renderTurnWithTerms = (
+        answerText: string,
+        termsForTurn: TermAnnotation[],
+        final: boolean,
+      ) => {
+        updateCardTurns(cardId, (current) =>
+          current.map((turn) =>
+            turn.id === id
+              ? {
+                  ...turn,
+                  ...(final ? { assistantText: answerText } : {}),
+                  body: final ? (
+                    <AnnotatedReply
+                      answer={answerText}
+                      terms={termsForTurn}
+                      modelLabel={
+                        demo
+                          ? "演示模型"
+                          : replyProvider ?? apiModel.trim()
+                      }
+                      networkEnabled={networkEnabled}
+                      demo={demo}
+                      onTermClick={(term) =>
+                        openAnnotatedBranch(cardId, id, term)
+                      }
+                    />
+                  ) : (
+                    <StreamingAnnotatedReply
+                      answer={answerText}
+                      terms={termsForTurn}
+                      onTermClick={(term) =>
+                        openAnnotatedBranch(cardId, id, term)
+                      }
+                    />
+                  ),
+                }
+              : turn,
+          ),
+        );
+      };
+
+      // Handed to requestAiReplyStream: called once per complete paragraph.
+      // Kicks off an async term-extraction per paragraph (fully parallel with
+      // the ongoing stream) and stores results in the streaming slot so the
+      // flush interval renders annotated buttons while the body keeps flowing.
+      let replyProvider = "";
+      const onParagraph = (paragraphText: string, offset: number) => {
+        requestTerms(paragraphText, offset)
+          .then((newTerms) => {
+            if (newTerms.length === 0) return;
+            turnTerms = mergeTerms(turnTerms, newTerms);
+            const slot = streamingRefs.current.get(cardId);
+            if (slot && slot.turnId === id) {
+              slot.terms = turnTerms;
+              slot.dirty = true;
+            }
+          })
+          .catch(() => {
+            // Terms are optional — keep the paragraph as plain text.
+          });
+      };
+
+      // Kept in sync with the streamed text so paragraph callbacks can render
+      // against the latest body even while streaming is still in progress.
+      const currentAnswerRef = { current: "" };
+
+      const reply = await requestAiReplyStream(
+        question,
+        sourceCard,
+        (cumulativeText: string) => {
+          currentAnswerRef.current = cumulativeText;
+          const slot = streamingRefs.current.get(cardId);
+          if (slot && slot.turnId === id) {
+            slot.text = cumulativeText;
+            slot.dirty = true;
+          }
+        },
+        onParagraph,
+        contextTurns,
       );
+      replyProvider = reply.providerModel ?? "";
+
+      // Streaming complete — clear THIS card's streaming state and finalize
+      // with AnnotatedReply. Other cards' streaming states are untouched.
+      streamingRefs.current.delete(cardId);
+      currentAnswerRef.current = reply.answer;
+
+      // Merge any terms that arrived in the final "terms" SSE event.
+      if (reply.terms.length > 0) {
+        turnTerms = mergeTerms(turnTerms, reply.terms);
+      }
+      renderTurnWithTerms(reply.answer, turnTerms, true);
+
+      // Safety net: if no paragraph ever produced terms (e.g. single-paragraph
+      // reply where the flush already handled it, or all requests failed),
+      // do one final attempt on the whole answer.
+      if (!demo && turnTerms.length === 0) {
+        requestTerms(reply.answer)
+          .then((newTerms) => {
+            if (newTerms.length === 0) return;
+            turnTerms = mergeTerms(turnTerms, newTerms);
+            renderTurnWithTerms(reply.answer, turnTerms, true);
+          })
+          .catch(() => {
+            // Terms are optional — keep the plain answer.
+          });
+      }
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "模型接口请求失败";
-      updateCardTurns(cardId, (current) =>
-        current.map((turn) =>
-          turn.id === id
-            ? {
-                ...turn,
-                body: (
-                  <div className="api-reply-error" role="alert">
-                    <strong>API 请求未完成</strong>
-                    <p>{errorMessage}</p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSettingsTab("可用模型");
-                        setModal("settings");
-                      }}
-                    >
-                      检查 API 设置
-                    </button>
-                  </div>
-                ),
-              }
-            : turn,
-        ),
-      );
+      streamingRefs.current.delete(cardId);
+
+      // Demo mode fallback (shouldn't normally throw, but be safe)
+      const demo = !apiUrl.trim() || !apiKey.trim() || !apiModel.trim();
+      if (demo) {
+        const reply = buildDemoReply();
+        updateCardTurns(cardId, (current) =>
+          current.map((turn) =>
+            turn.id === id
+              ? {
+                  ...turn,
+                  assistantText: reply.answer,
+                  body: (
+                    <AnnotatedReply
+                      answer={reply.answer}
+                      terms={reply.terms}
+                      modelLabel="演示模型"
+                      networkEnabled={false}
+                      demo
+                      onTermClick={(term) =>
+                        openAnnotatedBranch(cardId, id, term)
+                      }
+                    />
+                  ),
+                }
+              : turn,
+          ),
+        );
+        return;
+      }
+
+      // Streaming failed — try non-streaming fallback
+      try {
+        const reply = await requestAiReply(question, sourceCard);
+        updateCardTurns(cardId, (current) =>
+          current.map((turn) =>
+            turn.id === id
+              ? {
+                  ...turn,
+                  assistantText: reply.answer,
+                  body: (
+                    <AnnotatedReply
+                      answer={reply.answer}
+                      terms={reply.terms}
+                      modelLabel={
+                        reply.providerModel ?? apiModel.trim()
+                      }
+                      networkEnabled={networkEnabled}
+                      onTermClick={(term) =>
+                        openAnnotatedBranch(cardId, id, term)
+                      }
+                    />
+                  ),
+                }
+              : turn,
+          ),
+        );
+      } catch (fallbackError) {
+        // Both methods failed — show error UI
+        const errorMessage =
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : "模型接口请求失败";
+        updateCardTurns(cardId, (current) =>
+          current.map((turn) =>
+            turn.id === id
+              ? {
+                  ...turn,
+                  body: (
+                    <div className="api-reply-error" role="alert">
+                      <strong>API 请求未完成</strong>
+                      <p>{errorMessage}</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSettingsTab("可用模型");
+                          setModal("settings");
+                        }}
+                      >
+                        检查 API 设置
+                      </button>
+                    </div>
+                  ),
+                }
+              : turn,
+          ),
+        );
+      }
     }
   };
 
   const sendMessage = async () => {
     const clean = message.trim();
-    if (!clean || sending) return;
+    const readyAttachments = attachments.filter((att) => !att.uploading);
+    const hasAttachments = readyAttachments.length > 0;
+    if ((!clean && !hasAttachments) || sending) return;
     setSending(true);
+
+    const displayQuestion = clean || "请分析上传的文件内容";
+    let attachmentContext = "";
+    const turnAttachments: TurnAttachment[] = [];
+
+    if (readyAttachments.length > 0) {
+      for (const att of readyAttachments) {
+        turnAttachments.push({ name: att.name, type: att.type, size: att.size });
+      }
+      // Build the full context for AI (not shown to user)
+      const fileContexts = readyAttachments
+        .map((att) => {
+          const header = `【附件：${att.name} · ${att.type} · ${formatFileSize(att.size)}】`;
+          if (att.text) {
+            const label = att.truncated ? "（内容已截断至前 80 KB）" : "";
+            return `${header}${label}\n${att.text}`;
+          }
+          return `${header}\n[二进制文件，无法提取文本内容]`;
+        })
+        .join("\n\n");
+      attachmentContext = `\n\n--- 以下为上传文件内容，仅供分析参考 ---\n\n${fileContexts}`;
+    }
+
+    // Stash AI-only context in ref so requestAiReply can append it
+    pendingAttachmentContextRef.current = attachmentContext;
+
     setMessage("");
+    clearAttachments();
     setModelOpen(false);
     try {
-      await sendProgrammaticMessage(clean, activeCardId);
+      await sendProgrammaticMessage(displayQuestion, activeCardId, turnAttachments);
     } finally {
       setSending(false);
     }
@@ -1323,6 +2456,8 @@ export default function Home() {
         remaining.find((card) => card.id === backgroundCardId) ??
         remaining[0];
       if (activeCard.linkKey) branchTargetRef.current.delete(activeCard.linkKey);
+      // Release the removed card's streaming state so its slot is reclaimed.
+      streamingRefs.current.delete(activeCard.id);
       commitCards(remaining);
       commitActiveCard(fallback.id);
       setBackgroundCardId(
@@ -1393,9 +2528,14 @@ export default function Home() {
             ref={fileInputRef}
             type="file"
             hidden
-            onChange={(event) =>
-              event.target.files?.[0] && notify(`已选择文档：${event.target.files[0].name}`)
-            }
+            accept=".txt,.md,.csv,.json,.pdf,.docx,.pptx,.xlsx,.html,.css,.js,.ts,.py,.log,.xml,.yaml,.yml"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) {
+                uploadDocumentAndCreateCard(file);
+                event.target.value = "";
+              }
+            }}
           />
           <input
             ref={importInputRef}
@@ -1706,9 +2846,32 @@ export default function Home() {
               <section className="chat-turn" key={turn.id} id={`turn-${turn.id}`}>
                 <h2>{turn.title}</h2>
                 {turn.user && (
-                  <div className="user-line">
-                    <span>{turn.user}</span>
-                    <UserRound size={16} />
+                  <div className="user-message-group">
+                    <div className="user-line">
+                      <span>{turn.user}</span>
+                      <UserRound size={16} />
+                    </div>
+                    {turn.attachments && turn.attachments.length > 0 && (
+                      <div className="user-attachments">
+                        {turn.attachments.map((att, index) => (
+                          <span className="user-attachment-tag" key={index}>
+                            <Paperclip size={11} />
+                            <span className="user-attachment-name">{att.name}</span>
+                            <span className="user-attachment-meta">
+                              {att.type.split("/")[0] === "text"
+                                ? att.type.split("/")[1] ?? att.type
+                                : att.type.split("/")[0]}
+                              {" · "}
+                              {att.size < 1024
+                                ? `${att.size} B`
+                                : att.size < 1024 * 1024
+                                  ? `${(att.size / 1024).toFixed(1)} KB`
+                                  : `${(att.size / (1024 * 1024)).toFixed(1)} MB`}
+                            </span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
                 <div className="answer-copy">{turn.body}</div>
@@ -1905,6 +3068,31 @@ export default function Home() {
 
       <section className="composer-shell" aria-label="消息输入区">
         <div className="composer">
+          {attachments.length > 0 && (
+            <div className="attachment-strip">
+              {attachments.map((att) => (
+                <span
+                  className={`attachment-chip${att.uploading ? " uploading" : ""}`}
+                  key={att.id}
+                  title={`${att.name} · ${formatFileSize(att.size)}${att.truncated ? " · 已截断" : ""}`}
+                >
+                  <span className="attachment-chip-icon">
+                    <Paperclip size={13} />
+                  </span>
+                  <span className="attachment-chip-name">{att.name}</span>
+                  <span className="attachment-chip-size">{formatFileSize(att.size)}</span>
+                  <button
+                    type="button"
+                    className="attachment-chip-remove"
+                    aria-label={`移除 ${att.name}`}
+                    onClick={() => removeAttachment(att.id)}
+                  >
+                    <X size={13} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="composer-left">
             <div className="model-picker" ref={modelPickerRef}>
               <button type="button" onClick={() => setModelOpen((open) => !open)}>
@@ -1973,14 +3161,20 @@ export default function Home() {
             ref={attachmentRef}
             type="file"
             hidden
-            onChange={(event) =>
-              event.target.files?.[0] && notify(`已添加附件：${event.target.files[0].name}`)
-            }
+            multiple
+            onChange={(event) => {
+              uploadFiles(event.target.files);
+              event.target.value = "";
+            }}
           />
         </div>
       </section>
 
-      <button className="mobile-menu" aria-label="菜单" onClick={openSidebar}>
+      <button
+        className="mobile-menu"
+        aria-label="菜单"
+        onClick={() => openSidebar()}
+      >
         <Menu size={20} />
       </button>
 
