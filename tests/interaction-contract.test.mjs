@@ -224,7 +224,7 @@ test("AI gateway requests structured annotations without persisting credentials"
   assert.match(apiRoute, /只返回 JSON/);
   assert.match(apiRoute, /function normalizeTerms/);
   assert.match(apiRoute, /answer\.slice\(requestedStart, requestedEnd\) === text/);
-  assert.match(apiRoute, /accepted\.length >= 6/);
+  assert.match(apiRoute, /const accepted: typeof normalized = \[\];/);
   assert.match(apiRoute, /Cache-Control": "no-store"/);
   assert.doesNotMatch(apiRoute, /localStorage|sessionStorage|console\.(?:log|error)/);
 });
